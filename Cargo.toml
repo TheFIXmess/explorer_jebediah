@@ -1,0 +1,18 @@
+[package]
+name = "explorer_jebediah"
+version = "0.1.0"
+edition = "2024"
+
+# Explorer Jebediah — The Reckless Cartographer
+# Inspired by Jebediah Kerman (KSP): fearless, chaotic, maps everything,
+# treats near-death as exciting data. Implements the ExplorerAI protocol
+# from common-game v3.0.0.
+
+[dependencies]
+common-game  = "3.0.0"
+crossbeam-channel = "0.5"
+log          = "0.4"
+rand         = "0.8"          # for reckless planet selection tie-breaking
+
+[dev-dependencies]
+# none yet — integration tests will be added as the AI matures
