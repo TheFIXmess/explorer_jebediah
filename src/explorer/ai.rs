@@ -4,9 +4,11 @@
 //! (`Idle`, `OnPlanet`, `Traveling`) is encoded as a generic type parameter so
 //! invalid transitions are caught at compile time rather than at runtime.
 //!
-//! The orchestrator only interacts with the `JebExplorer` type alias, which
-//! fixes the state to `Idle` at construction. All state transitions happen
-//! internally inside `run()`.
+//! Jebediah's main priority is fast exploration:
+//! - ask neighbors as soon as the AI starts;
+//! - travel immediately when a destination is known;
+//! - ask neighbors again immediately after every successful move;
+//! - resource-related requests are still supported, but movement has priority.
 
 use std::marker::PhantomData;
 
@@ -14,7 +16,10 @@ use common_game::protocols::orchestrator_explorer::{
     ExplorerToOrchestrator,
     OrchestratorToExplorer,
 };
-use common_game::protocols::planet_explorer::{ExplorerToPlanet, PlanetToExplorer};
+use common_game::protocols::planet_explorer::{
+    ExplorerToPlanet,
+    PlanetToExplorer,
+};
 use common_game::utils::ID;
 use crossbeam_channel::{Receiver, Sender};
 
@@ -25,8 +30,6 @@ use super::mood::{JebEvent, Mood};
 use super::navigation;
 
 use crate::BagSummary;
-
-// Zero-sized state marker types. No runtime cost; used only by the compiler.
 
 /// Explorer is waiting for the orchestrator to start it.
 pub struct Idle;
@@ -41,8 +44,6 @@ pub struct Traveling {
     pub destination: ID,
 }
 
-// Sealed trait: only the three states above can be used as the generic parameter.
-// External code cannot introduce new states.
 mod private {
     pub trait Sealed {}
 
@@ -59,16 +60,12 @@ impl State for OnPlanet {}
 impl State for Traveling {}
 
 /// Jebediah Kerman — the reckless cartographer.
-///
-/// The generic `S` encodes the current state. The orchestrator uses the
-/// [`JebExplorer`] alias and never interacts with the generic parameter directly.
 pub struct JebExplorerInner<S: State> {
     pub(crate) id: ID,
     pub(crate) rx_orchestrator: Receiver<OrchestratorToExplorer>,
     pub(crate) tx_orchestrator: Sender<ExplorerToOrchestrator<BagSummary>>,
 
-    /// Permanent receiver for planet messages. Created once at spawn; the sender
-    /// is handed to each new planet when the explorer arrives.
+    /// Permanent receiver for planet messages.
     pub(crate) rx_planet: Receiver<PlanetToExplorer>,
 
     /// Sender to the current planet. Replaced on every move.
@@ -127,6 +124,7 @@ impl JebExplorerInner<Idle> {
                         break;
                     }
                 }
+
                 Err(_) => {
                     logging::log_explorer_event(
                         self.id,
@@ -147,10 +145,62 @@ impl JebExplorerInner<Idle> {
         );
 
         log::info!("[Jeb #{}] Going dark.", self.id);
+
         Ok(())
     }
 
-    /// Returns `false` when the explorer should stop, for example on `KillExplorer`.
+    fn request_neighbors(&self, current_planet: ID) {
+        logging::log_explorer_to_orchestrator_message(
+            self.id,
+            format!("NeighborsRequest from planet {current_planet}"),
+        );
+
+        logging::log_explorer_event(
+            self.id,
+            format!("[EXPLORE] Requesting neighbors from planet {current_planet}"),
+            common_game::logging::Channel::Info,
+        );
+
+        let _ = self.tx_orchestrator.send(ExplorerToOrchestrator::NeighborsRequest {
+            explorer_id: self.id,
+            current_planet_id: current_planet,
+        });
+    }
+
+    fn send_travel_request(&self, current_planet: ID, destination: ID) {
+        if current_planet == destination {
+            logging::log_explorer_event(
+                self.id,
+                format!(
+                    "[EXPLORE] Travel ignored because destination equals current planet: {destination}"
+                ),
+                common_game::logging::Channel::Warning,
+            );
+
+            return;
+        }
+
+        logging::log_explorer_to_orchestrator_message(
+            self.id,
+            format!("TravelToPlanetRequest from {current_planet} to {destination}"),
+        );
+
+        logging::log_explorer_event(
+            self.id,
+            format!(
+                "[EXPLORE] Requesting travel from planet {current_planet} to planet {destination}"
+            ),
+            common_game::logging::Channel::Info,
+        );
+
+        let _ = self.tx_orchestrator.send(ExplorerToOrchestrator::TravelToPlanetRequest {
+            explorer_id: self.id,
+            current_planet_id: current_planet,
+            dst_planet_id: destination,
+        });
+    }
+
+    /// Returns `false` when the explorer should stop.
     fn handle_orchestrator_message(&mut self, msg: OrchestratorToExplorer) -> bool {
         use ExplorerToOrchestrator::*;
         use OrchestratorToExplorer::*;
@@ -165,7 +215,7 @@ impl JebExplorerInner<Idle> {
             StartExplorerAI => {
                 logging::log_explorer_event(
                     self.id,
-                    "Explorer AI started",
+                    "Explorer AI started - movement priority enabled",
                     common_game::logging::Channel::Info,
                 );
 
@@ -178,6 +228,10 @@ impl JebExplorerInner<Idle> {
                 let _ = self.tx_orchestrator.send(StartExplorerAIResult {
                     explorer_id: self.id,
                 });
+
+                if let Some(current) = self.current_planet {
+                    self.request_neighbors(current);
+                }
             }
 
             StopExplorerAI => {
@@ -215,13 +269,15 @@ impl JebExplorerInner<Idle> {
             }
 
             ResetExplorerAI => {
-                self.map = GalaxyMap::new(self.current_planet.unwrap_or(0));
+                let current = self.current_planet.unwrap_or(0);
+
+                self.map = GalaxyMap::new(current);
                 self.bag = JebBag::new();
                 self.mood = Mood::new(self.id);
 
                 logging::log_explorer_event(
                     self.id,
-                    "Explorer AI reset",
+                    format!("Explorer AI reset on planet {current}"),
                     common_game::logging::Channel::Info,
                 );
 
@@ -230,6 +286,10 @@ impl JebExplorerInner<Idle> {
                 let _ = self.tx_orchestrator.send(ResetExplorerAIResult {
                     explorer_id: self.id,
                 });
+
+                if current != 0 {
+                    self.request_neighbors(current);
+                }
             }
 
             MoveToPlanet {
@@ -238,26 +298,68 @@ impl JebExplorerInner<Idle> {
             } => {
                 let from = self.current_planet.unwrap_or(planet_id);
 
-                if let Some(new_tx) = sender_to_new_planet {
-                    self.tx_planet = new_tx;
+                match sender_to_new_planet {
+                    Some(new_tx) => {
+                        self.tx_planet = new_tx;
+                        self.current_planet = Some(planet_id);
+                        self.map.visit(planet_id);
+
+                        logging::log_travel(
+                            self.id,
+                            from,
+                            planet_id,
+                            true,
+                        );
+
+                        logging::log_explorer_event(
+                            self.id,
+                            format!(
+                                "[EXPLORE] Arrived on planet {planet_id}. Asking neighbors immediately."
+                            ),
+                            common_game::logging::Channel::Info,
+                        );
+
+                        log::info!(
+                            "[Jeb #{}] {} Arrived at planet {}.",
+                            self.id,
+                            self.mood.on_event(JebEvent::Arrived(planet_id)),
+                            planet_id
+                        );
+
+                        let _ = self.tx_orchestrator.send(MovedToPlanetResult {
+                            explorer_id: self.id,
+                            planet_id,
+                        });
+
+                        self.request_neighbors(planet_id);
+                    }
+
+                    None => {
+                        logging::log_travel(
+                            self.id,
+                            from,
+                            planet_id,
+                            false,
+                        );
+
+                        logging::log_explorer_event(
+                            self.id,
+                            format!(
+                                "[EXPLORE] Failed to move from planet {from} to planet {planet_id}. Staying on planet {from}."
+                            ),
+                            common_game::logging::Channel::Warning,
+                        );
+
+                        let _ = self.tx_orchestrator.send(MovedToPlanetResult {
+                            explorer_id: self.id,
+                            planet_id,
+                        });
+
+                        if let Some(current) = self.current_planet {
+                            self.request_neighbors(current);
+                        }
+                    }
                 }
-
-                self.current_planet = Some(planet_id);
-                self.map.visit(planet_id);
-
-                logging::log_travel(self.id, from, planet_id, true);
-
-                log::info!(
-                    "[Jeb #{}] {} Arrived at planet {}.",
-                    self.id,
-                    self.mood.on_event(JebEvent::Arrived(planet_id)),
-                    planet_id
-                );
-
-                let _ = self.tx_orchestrator.send(MovedToPlanetResult {
-                    explorer_id: self.id,
-                    planet_id,
-                });
             }
 
             CurrentPlanetRequest => {
@@ -275,33 +377,62 @@ impl JebExplorerInner<Idle> {
             }
 
             NeighborsResponse { neighbors } => {
-                if let Some(current) = self.current_planet {
-                    self.map.record_neighbors(current, neighbors.clone());
+                let Some(current) = self.current_planet else {
+                    logging::log_explorer_event(
+                        self.id,
+                        "NeighborsResponse received but current planet is unknown",
+                        common_game::logging::Channel::Warning,
+                    );
 
-                    logging::log_neighbors(self.id, current, &neighbors);
+                    return true;
+                };
 
-                    for neighbor in &neighbors {
-                        if self.map.visit_count(*neighbor) == 0 {
-                            let _ = self.mood.on_event(JebEvent::DiscoveredNeighbor(*neighbor));
-                        }
+                self.map.record_neighbors(current, neighbors.clone());
+
+                logging::log_neighbors(
+                    self.id,
+                    current,
+                    &neighbors,
+                );
+
+                logging::log_explorer_event(
+                    self.id,
+                    format!(
+                        "[EXPLORE] Map updated from planet {current}. {}",
+                        self.map.log_summary()
+                    ),
+                    common_game::logging::Channel::Info,
+                );
+
+                for neighbor in &neighbors {
+                    if self.map.visit_count(*neighbor) == 0 {
+                        let _ = self
+                            .mood
+                            .on_event(JebEvent::DiscoveredNeighbor(*neighbor));
                     }
+                }
 
-                    if let Some(dst) = navigation::pick_destination(current, &self.map) {
-                        logging::log_explorer_to_orchestrator_message(
-                            self.id,
-                            format!("TravelToPlanetRequest from {current} to {dst}"),
-                        );
-
-                        let _ = self.tx_orchestrator.send(TravelToPlanetRequest {
-                            explorer_id: self.id,
-                            current_planet_id: current,
-                            dst_planet_id: dst,
-                        });
-                    } else {
+                match navigation::pick_destination(current, &self.map) {
+                    Some(destination) => {
                         logging::log_explorer_event(
                             self.id,
-                            "No destination available from current planet",
-                            common_game::logging::Channel::Debug,
+                            format!(
+                                "[EXPLORE] Navigation selected destination {destination} from planet {current}"
+                            ),
+                            common_game::logging::Channel::Info,
+                        );
+
+                        self.send_travel_request(current, destination);
+                    }
+
+                    None => {
+                        logging::log_explorer_event(
+                            self.id,
+                            format!(
+                                "[EXPLORE] No destination available from planet {current}. {}",
+                                self.map.log_summary()
+                            ),
+                            common_game::logging::Channel::Info,
                         );
 
                         let _ = self.mood.on_event(JebEvent::FullyMapped);
@@ -312,7 +443,10 @@ impl JebExplorerInner<Idle> {
             BagContentRequest => {
                 let summary = self.bag.summarize();
 
-                logging::log_bag_summary(self.id, summary.len());
+                logging::log_bag_summary(
+                    self.id,
+                    summary.len(),
+                );
 
                 let _ = self.tx_orchestrator.send(BagContentResponse {
                     explorer_id: self.id,
@@ -321,6 +455,12 @@ impl JebExplorerInner<Idle> {
             }
 
             SupportedResourceRequest => {
+                logging::log_explorer_event(
+                    self.id,
+                    "Manual SupportedResourceRequest received",
+                    common_game::logging::Channel::Debug,
+                );
+
                 let _ = self.tx_planet.send(ExplorerToPlanet::SupportedResourceRequest {
                     explorer_id: self.id,
                 });
@@ -342,6 +482,7 @@ impl JebExplorerInner<Idle> {
                             });
                         }
                     }
+
                     Err(_) => {
                         logging::log_explorer_event(
                             self.id,
@@ -350,9 +491,19 @@ impl JebExplorerInner<Idle> {
                         );
                     }
                 }
+
+                if let Some(current) = self.current_planet {
+                    self.request_neighbors(current);
+                }
             }
 
             SupportedCombinationRequest => {
+                logging::log_explorer_event(
+                    self.id,
+                    "Manual SupportedCombinationRequest received",
+                    common_game::logging::Channel::Debug,
+                );
+
                 let _ = self
                     .tx_planet
                     .send(ExplorerToPlanet::SupportedCombinationRequest {
@@ -379,6 +530,7 @@ impl JebExplorerInner<Idle> {
                             });
                         }
                     }
+
                     Err(_) => {
                         logging::log_explorer_event(
                             self.id,
@@ -387,9 +539,19 @@ impl JebExplorerInner<Idle> {
                         );
                     }
                 }
+
+                if let Some(current) = self.current_planet {
+                    self.request_neighbors(current);
+                }
             }
 
             GenerateResourceRequest { to_generate } => {
+                logging::log_explorer_event(
+                    self.id,
+                    format!("Manual GenerateResourceRequest received: {to_generate:?}"),
+                    common_game::logging::Channel::Debug,
+                );
+
                 let _ = self.tx_planet.send(ExplorerToPlanet::GenerateResourceRequest {
                     explorer_id: self.id,
                     resource: to_generate,
@@ -406,7 +568,9 @@ impl JebExplorerInner<Idle> {
                         );
 
                         match msg {
-                            PlanetToExplorer::GenerateResourceResponse { resource: Some(res) } => {
+                            PlanetToExplorer::GenerateResourceResponse {
+                                resource: Some(res),
+                            } => {
                                 logging::log_resource_generation_attempt(
                                     self.id,
                                     format!("{:?}", res.get_type()),
@@ -414,6 +578,7 @@ impl JebExplorerInner<Idle> {
                                 );
 
                                 self.bag.add_basic(res);
+
                                 let _ = self.mood.on_event(JebEvent::CollectedResource);
 
                                 let _ = self.tx_orchestrator.send(GenerateResourceResponse {
@@ -422,10 +587,12 @@ impl JebExplorerInner<Idle> {
                                 });
                             }
 
-                            PlanetToExplorer::GenerateResourceResponse { resource: None } => {
+                            PlanetToExplorer::GenerateResourceResponse {
+                                resource: None,
+                            } => {
                                 logging::log_resource_generation_attempt(
                                     self.id,
-                                    "unknown",
+                                    format!("{to_generate:?}"),
                                     false,
                                 );
 
@@ -449,10 +616,11 @@ impl JebExplorerInner<Idle> {
                             }
                         }
                     }
+
                     Err(_) => {
                         logging::log_resource_generation_attempt(
                             self.id,
-                            "unknown",
+                            format!("{to_generate:?}"),
                             false,
                         );
 
@@ -464,6 +632,10 @@ impl JebExplorerInner<Idle> {
                             ),
                         });
                     }
+                }
+
+                if let Some(current) = self.current_planet {
+                    self.request_neighbors(current);
                 }
             }
 
@@ -478,6 +650,10 @@ impl JebExplorerInner<Idle> {
                     explorer_id: self.id,
                     generated: Err("combine not yet implemented".to_string()),
                 });
+
+                if let Some(current) = self.current_planet {
+                    self.request_neighbors(current);
+                }
             }
         }
 
@@ -512,19 +688,24 @@ impl JebExplorerInner<Idle> {
             PlanetToExplorer::SupportedResourceResponse { .. } => {
                 "SupportedResourceResponse"
             }
+
             PlanetToExplorer::SupportedCombinationResponse { .. } => {
                 "SupportedCombinationResponse"
             }
+
             PlanetToExplorer::GenerateResourceResponse { .. } => {
                 "GenerateResourceResponse"
             }
+
             PlanetToExplorer::CombineResourceResponse { .. } => {
                 "CombineResourceResponse"
             }
+
             PlanetToExplorer::AvailableEnergyCellResponse { .. } => {
                 "AvailableEnergyCellResponse"
             }
-            PlanetToExplorer::Stopped { .. } => "Stopped"
+
+            PlanetToExplorer::Stopped { .. } => "Stopped",
         }
     }
 }
